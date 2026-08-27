@@ -1,0 +1,795 @@
+#requires -version 5.1
+
+<#
+.SYNOPSIS
+    Prepares a Windows computer for working with the R&P app template.
+
+.DESCRIPTION
+    Installs and configures WSL 2 with Ubuntu, Docker Desktop, Git for Windows,
+    Visual Studio Code, the Dev Containers extension, and a GitHub SSH key.
+    Existing installations are detected and skipped. New installations use the
+    latest versions available from WSL or WinGet.
+
+    The script is intended to be run from a Gist like this:
+
+        irm <RAW-GIST-URL> | iex
+
+    At startup, the script asks for the Git email address and derives the Git
+    user name from it. If the current PowerShell is not elevated, Windows then
+    displays one UAC prompt. The script never restarts the computer automatically.
+#>
+
+$setup = {
+    param(
+        [string] $ResultPath,
+        [string] $GitEmail,
+        [string] $GitName
+    )
+
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = "Stop"
+    $ProgressPreference = "SilentlyContinue"
+
+    $script:RestartRequired = $false
+    $script:RerunAfterRestart = $false
+    $script:Winget = $null
+    $summary = [System.Collections.Generic.List[string]]::new()
+
+    # WinGet-Rueckgabewerte, die keinen Fehler darstellen.
+    $script:WinGetSuccessCodes = @(
+        0,
+        1641,        # MSI: Installer hat den Neustart eingeleitet
+        3010,        # MSI: Neustart erforderlich, Installation aber erfolgreich
+        -1978335189  # 0x8A15002B: kein passendes Update (bereits aktuell)
+    )
+    $script:WinGetRestartCodes = @(1641, 3010)
+
+    function Write-Step {
+        param([string] $Message)
+
+        Write-Host "`n==> $Message" -ForegroundColor Cyan
+    }
+
+    function Update-SessionPath {
+        $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        $env:Path = "$machinePath;$userPath"
+    }
+
+    function Invoke-Native {
+        <#
+            Ruft ein externes Programm auf, ohne dass Ausgaben auf stderr wegen
+            $ErrorActionPreference = "Stop" zum Abbruch fuehren. Liefert Exitcode
+            und zusammengefuehrte Ausgabe zurueck; UTF-16-Nullbytes (z. B. von
+            wsl.exe) werden entfernt.
+        #>
+        param(
+            [Parameter(Mandatory = $true)]
+            [string] $FilePath,
+            [string[]] $Arguments = @(),
+            [switch] $Show
+        )
+
+        # Systemwerkzeuge wie wsl.exe liegen in System32, das nicht in jeder
+        # Sitzung im Pfad steht.
+        $resolved = $null
+        $command = Get-Command $FilePath -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -ne $command) {
+            $resolved = $command.Source
+        }
+        elseif ([IO.Path]::IsPathRooted($FilePath) -and (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+            $resolved = $FilePath
+        }
+        else {
+            $systemPath = Join-Path $env:WINDIR "System32\$FilePath"
+            if (Test-Path -LiteralPath $systemPath -PathType Leaf) {
+                $resolved = $systemPath
+            }
+        }
+        if (-not $resolved) {
+            throw "Das Programm '$FilePath' wurde nicht gefunden."
+        }
+
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = 0
+        try {
+            $lines = & $resolved @Arguments 2>&1 | ForEach-Object {
+                if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { "$_" }
+            }
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $previousPreference
+        }
+
+        $text = (($lines -join "`n") -replace "`0", "")
+        if ($Show -and $text.Trim()) {
+            Write-Host $text
+        }
+
+        return [pscustomobject]@{
+            ExitCode = $exitCode
+            Output   = $text
+        }
+    }
+
+    function Resolve-Executable {
+        param(
+            [string] $Command,
+            [string[]] $CandidatePaths = @()
+        )
+
+        $found = Get-Command $Command -ErrorAction SilentlyContinue
+        if ($null -ne $found) {
+            return $found.Source
+        }
+
+        foreach ($candidate in $CandidatePaths) {
+            if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+                return $candidate
+            }
+        }
+
+        return $null
+    }
+
+    function Initialize-WinGet {
+        Write-Step "Pruefe Windows Package Manager (WinGet)"
+
+        $wingetPath = Resolve-Executable -Command "winget.exe" -CandidatePaths @(
+            (Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\winget.exe")
+        )
+
+        if (-not $wingetPath) {
+            try {
+                Add-AppxPackage `
+                    -RegisterByFamilyName `
+                    -MainPackage "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe" `
+                    -ErrorAction Stop
+            }
+            catch {
+                Write-Host "WinGet ist nicht registriert; repariere die Installation ..."
+                [Net.ServicePointManager]::SecurityProtocol = `
+                    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                Install-PackageProvider `
+                    -Name NuGet `
+                    -Force `
+                    -Scope CurrentUser `
+                    -Confirm:$false | Out-Null
+                Install-Module `
+                    -Name Microsoft.WinGet.Client `
+                    -Repository PSGallery `
+                    -Scope CurrentUser `
+                    -Force `
+                    -AllowClobber `
+                    -Confirm:$false
+                Import-Module Microsoft.WinGet.Client -Force
+                Repair-WinGetPackageManager -Force -Latest | Out-Null
+            }
+
+            Update-SessionPath
+            $wingetPath = Resolve-Executable -Command "winget.exe" -CandidatePaths @(
+                (Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\winget.exe")
+            )
+        }
+
+        if (-not $wingetPath) {
+            throw "WinGet konnte nicht installiert oder gefunden werden."
+        }
+
+        $script:Winget = $wingetPath
+
+        # Eine fehlgeschlagene Quellenaktualisierung ist meist ein Netzwerkproblem
+        # und darf das Setup nicht abbrechen.
+        $result = Invoke-Native -FilePath $script:Winget -Arguments @(
+            "source", "update",
+            "--disable-interactivity"
+        ) -Show
+        if ($result.ExitCode -ne 0) {
+            Write-Host "Hinweis: Die WinGet-Paketquellen konnten nicht aktualisiert werden (Code $($result.ExitCode))." `
+                -ForegroundColor Yellow
+        }
+    }
+
+    function Test-WinGetPackage {
+        param([string] $Id)
+
+        # Ohne "--source winget", damit auch Pakete erkannt werden, die nicht
+        # ueber WinGet installiert wurden (z. B. Docker Desktop von docker.com).
+        $result = Invoke-Native -FilePath $script:Winget -Arguments @(
+            "list",
+            "--id", $Id,
+            "--exact",
+            "--accept-source-agreements",
+            "--disable-interactivity"
+        )
+
+        return ($result.ExitCode -eq 0) -and ($result.Output -match [regex]::Escape($Id))
+    }
+
+    function Install-WinGetPackage {
+        param(
+            [string] $Name,
+            [string] $Id,
+            [string] $Command,
+            [string[]] $CandidatePaths = @(),
+            [ValidateSet("user", "machine")]
+            [string] $Scope,
+            [string] $Override = ""
+        )
+
+        Write-Step "Pruefe $Name"
+
+        if ((Resolve-Executable -Command $Command -CandidatePaths $CandidatePaths) -or
+            (Test-WinGetPackage -Id $Id)) {
+            Write-Host "$Name ist bereits installiert; ueberspringe Installation."
+            $summary.Add("[OK] $Name war bereits installiert.")
+            return
+        }
+
+        Write-Host "Installiere die aktuelle Version von $Name ..."
+        $arguments = @(
+            "install",
+            "--id", $Id,
+            "--exact",
+            "--source", "winget",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+            "--no-upgrade"
+        )
+
+        if ($Override) {
+            # "--override" ersetzt die Installer-Argumente vollstaendig und darf
+            # von WinGet nicht mit "--silent" kombiniert werden.
+            $arguments += @("--override", $Override)
+        }
+        else {
+            $arguments += "--silent"
+        }
+        if ($Scope) {
+            $arguments += @("--scope", $Scope)
+        }
+
+        $result = Invoke-Native -FilePath $script:Winget -Arguments $arguments -Show
+        if ($result.ExitCode -notin $script:WinGetSuccessCodes) {
+            throw "Installation von $Name fehlgeschlagen (WinGet-Code $($result.ExitCode))."
+        }
+        if ($result.ExitCode -in $script:WinGetRestartCodes) {
+            $script:RestartRequired = $true
+        }
+
+        Update-SessionPath
+        $summary.Add("[OK] $Name wurde installiert.")
+    }
+
+    function Get-WslFeatureState {
+        $names = @("Microsoft-Windows-Subsystem-Linux", "VirtualMachinePlatform")
+        $states = foreach ($name in $names) {
+            $feature = Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction SilentlyContinue
+            if ($null -eq $feature) { "Missing" } else { $feature.State.ToString() }
+        }
+
+        return @($states)
+    }
+
+    function Enable-WslFeatures {
+        Write-Host "Aktiviere die fuer WSL 2 erforderlichen Windows-Komponenten ..."
+        foreach ($name in @("Microsoft-Windows-Subsystem-Linux", "VirtualMachinePlatform")) {
+            try {
+                Enable-WindowsOptionalFeature `
+                    -Online `
+                    -FeatureName $name `
+                    -All `
+                    -NoRestart `
+                    -ErrorAction Stop | Out-Null
+            }
+            catch {
+                throw "Die Windows-Komponente '$name' konnte nicht aktiviert werden: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    function Get-WslDistributions {
+        $result = Invoke-Native -FilePath "wsl.exe" -Arguments @("--list", "--quiet")
+        if ($result.ExitCode -ne 0) {
+            return @()
+        }
+
+        return @(
+            $result.Output -split "`r?`n" |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { $_ }
+        )
+    }
+
+    function Get-UbuntuDistribution {
+        return @(
+            Get-WslDistributions | Where-Object { $_ -match "^Ubuntu(?:-|$)" }
+        ) | Select-Object -First 1
+    }
+
+    function Get-WslVersion {
+        $result = Invoke-Native -FilePath "wsl.exe" -Arguments @("--version")
+        if ($result.ExitCode -ne 0) {
+            return $null
+        }
+
+        $match = [regex]::Match($result.Output, "\d+(?:\.\d+){2,3}")
+        if (-not $match.Success) {
+            return $null
+        }
+
+        return [version] $match.Value
+    }
+
+    function Install-UbuntuDistribution {
+        # "--no-launch" und "--web-download" kennt erst die Store-Version von WSL.
+        # Bei aelteren Versionen wird ohne diese Schalter erneut versucht.
+        $attempts = @(
+            @("--install", "--distribution", "Ubuntu", "--no-launch", "--web-download"),
+            @("--install", "--distribution", "Ubuntu", "--no-launch"),
+            @("--install", "--distribution", "Ubuntu")
+        )
+
+        $lastResult = $null
+        for ($index = 0; $index -lt $attempts.Count; $index++) {
+            $lastResult = Invoke-Native -FilePath "wsl.exe" -Arguments $attempts[$index] -Show
+            if ($lastResult.ExitCode -in @(0, 3010)) {
+                return [pscustomobject]@{
+                    Success  = $true
+                    ExitCode = $lastResult.ExitCode
+                    Output   = $lastResult.Output
+                }
+            }
+            if ($index -lt ($attempts.Count - 1)) {
+                Write-Host "Wiederhole die Installation ohne die nicht unterstuetzten Schalter ..."
+            }
+        }
+
+        return [pscustomobject]@{
+            Success  = $false
+            ExitCode = $lastResult.ExitCode
+            Output   = $lastResult.Output
+        }
+    }
+
+    function Initialize-Wsl {
+        Write-Step "Pruefe WSL 2 und Ubuntu"
+
+        $featureStates = Get-WslFeatureState
+        $featuresEnabled = @($featureStates | Where-Object { $_ -ne "Enabled" }).Count -eq 0
+        $ubuntuDistribution = Get-UbuntuDistribution
+        $ubuntuInstalled = $null -ne $ubuntuDistribution
+
+        if (-not $featuresEnabled) {
+            Enable-WslFeatures
+            $script:RestartRequired = $true
+            $summary.Add("[OK] Die Windows-Komponenten fuer WSL 2 wurden aktiviert.")
+        }
+
+        if (-not $ubuntuInstalled) {
+            Write-Host "Installiere die aktuelle WSL-Version mit Ubuntu ..."
+            if ($featuresEnabled) {
+                # Neue Distributionen sollen direkt als WSL 2 registriert werden.
+                Invoke-Native -FilePath "wsl.exe" -Arguments @("--set-default-version", "2") -Show | Out-Null
+            }
+
+            $installResult = Install-UbuntuDistribution
+            if ($installResult.Success) {
+                if ($installResult.ExitCode -eq 3010) {
+                    $script:RestartRequired = $true
+                }
+                $summary.Add("[OK] WSL 2 mit Ubuntu wurde installiert.")
+                $summary.Add("     Beim ersten Start von Ubuntu werden Benutzername und Passwort abgefragt.")
+            }
+            elseif ($script:RestartRequired) {
+                # Solange der Neustart aussteht, kann WSL keine Distribution registrieren.
+                $script:RerunAfterRestart = $true
+                $summary.Add("[!] Ubuntu konnte vor dem Neustart nicht installiert werden (Code $($installResult.ExitCode)).")
+            }
+            else {
+                throw "WSL/Ubuntu-Installation fehlgeschlagen (Code $($installResult.ExitCode))."
+            }
+        }
+        else {
+            Write-Host "Ubuntu ist bereits unter WSL installiert; ueberspringe Installation."
+            $summary.Add("[OK] WSL mit Ubuntu war bereits installiert.")
+            if ($script:RestartRequired) {
+                # Eine vorhandene WSL-1-Distribution laesst sich erst nach dem
+                # Neustart auf WSL 2 konvertieren.
+                $script:RerunAfterRestart = $true
+            }
+        }
+
+        if ($script:RestartRequired) {
+            return
+        }
+
+        $wslVersion = Get-WslVersion
+        if (($null -eq $wslVersion) -or ($wslVersion -lt [version] "2.1.5")) {
+            Write-Host "Aktualisiere WSL auf eine von Docker unterstuetzte Version ..."
+            $update = Invoke-Native -FilePath "wsl.exe" -Arguments @("--update", "--web-download") -Show
+            if ($update.ExitCode -ne 0) {
+                throw "WSL konnte nicht aktualisiert werden (Code $($update.ExitCode))."
+            }
+        }
+
+        $setVersion = Invoke-Native -FilePath "wsl.exe" -Arguments @("--set-default-version", "2") -Show
+        if ($setVersion.ExitCode -ne 0) {
+            throw "WSL 2 konnte nicht als Standard gesetzt werden (Code $($setVersion.ExitCode))."
+        }
+
+        $ubuntuDistribution = Get-UbuntuDistribution
+        if ($null -eq $ubuntuDistribution) {
+            return
+        }
+
+        $verboseList = (Invoke-Native -FilePath "wsl.exe" -Arguments @("--list", "--verbose")).Output
+        $escapedDistribution = [regex]::Escape($ubuntuDistribution)
+        if ($verboseList -notmatch "(?m)^\s*\*?\s*$escapedDistribution\s+.*\s2\s*$") {
+            Write-Host "Konvertiere $ubuntuDistribution zu WSL 2 ..."
+            $convert = Invoke-Native -FilePath "wsl.exe" -Arguments @("--set-version", $ubuntuDistribution, "2") -Show
+            if ($convert.ExitCode -ne 0) {
+                throw "Ubuntu konnte nicht auf WSL 2 konvertiert werden (Code $($convert.ExitCode))."
+            }
+        }
+
+        $setDefault = Invoke-Native -FilePath "wsl.exe" -Arguments @("--set-default", $ubuntuDistribution) -Show
+        if ($setDefault.ExitCode -ne 0) {
+            throw "Ubuntu konnte nicht als Standarddistribution gesetzt werden (Code $($setDefault.ExitCode))."
+        }
+    }
+
+    function Add-DockerUser {
+        # Docker Desktop kann nur von Mitgliedern der Gruppe "docker-users"
+        # gestartet werden.
+        try {
+            $group = Get-LocalGroup -Name "docker-users" -ErrorAction Stop
+        }
+        catch {
+            return
+        }
+
+        $account = "$env:USERDOMAIN\$env:USERNAME"
+        try {
+            $members = @(Get-LocalGroupMember -Group $group -ErrorAction Stop)
+        }
+        catch {
+            $members = @()
+        }
+
+        if (@($members | Where-Object { $_.Name -ieq $account }).Count -gt 0) {
+            return
+        }
+
+        try {
+            Add-LocalGroupMember -Group $group -Member $account -ErrorAction Stop
+            $summary.Add("[OK] $account wurde der Gruppe docker-users hinzugefuegt.")
+        }
+        catch {
+            Write-Host "Hinweis: $account konnte nicht zur Gruppe docker-users hinzugefuegt werden." `
+                -ForegroundColor Yellow
+        }
+    }
+
+    function Initialize-Git {
+        Write-Step "Konfiguriere Git"
+
+        $git = Resolve-Executable -Command "git.exe" -CandidatePaths @(
+            (Join-Path $env:ProgramFiles "Git\cmd\git.exe"),
+            (Join-Path $env:LOCALAPPDATA "Programs\Git\cmd\git.exe")
+        )
+        if (-not $git) {
+            throw "Git wurde installiert, aber git.exe wurde nicht gefunden."
+        }
+
+        $settings = @(
+            @("core.autocrlf", "input"),
+            @("user.email", $GitEmail),
+            @("user.name", $GitName)
+        )
+        foreach ($setting in $settings) {
+            $result = Invoke-Native -FilePath $git -Arguments @(
+                "config", "--global", $setting[0], $setting[1]
+            )
+            if ($result.ExitCode -ne 0) {
+                throw "Git $($setting[0]) konnte nicht konfiguriert werden: $($result.Output)"
+            }
+        }
+        $summary.Add("[OK] Git verwendet Linux-Zeilenenden (core.autocrlf=input).")
+        $summary.Add("[OK] Git-Benutzer: $GitName <$GitEmail>")
+    }
+
+    function Initialize-VsCodeExtension {
+        Write-Step "Pruefe VS Code Dev Containers"
+
+        $code = Resolve-Executable -Command "code.cmd" -CandidatePaths @(
+            (Join-Path $env:LOCALAPPDATA "Programs\Microsoft VS Code\bin\code.cmd"),
+            (Join-Path $env:ProgramFiles "Microsoft VS Code\bin\code.cmd")
+        )
+        if (-not $code) {
+            throw "VS Code wurde installiert, aber code.cmd wurde nicht gefunden."
+        }
+
+        $extensionId = "ms-vscode-remote.remote-containers"
+        $installed = (Invoke-Native -FilePath $code -Arguments @("--list-extensions")).Output
+        if ($installed -match "(?im)^\s*$([regex]::Escape($extensionId))\s*$") {
+            Write-Host "Dev Containers ist bereits installiert; ueberspringe Installation."
+            $summary.Add("[OK] VS Code Dev Containers war bereits installiert.")
+            return
+        }
+
+        $result = Invoke-Native -FilePath $code -Arguments @("--install-extension", $extensionId, "--force") -Show
+        if ($result.ExitCode -ne 0) {
+            throw "Die VS Code Dev Containers-Erweiterung konnte nicht installiert werden (Code $($result.ExitCode))."
+        }
+        $summary.Add("[OK] VS Code Dev Containers wurde installiert.")
+    }
+
+    function Get-UnusedKeyBase {
+        param([string] $Directory)
+
+        $index = 0
+        do {
+            $index++
+            $keyBase = Join-Path $Directory "id_ed25519_github_$index"
+        } while ((Test-Path -LiteralPath $keyBase) -or (Test-Path -LiteralPath "$keyBase.pub"))
+
+        return $keyBase
+    }
+
+    function Initialize-SshKey {
+        Write-Step "Pruefe GitHub SSH-Key"
+
+        $sshKeygen = Resolve-Executable -Command "ssh-keygen.exe" -CandidatePaths @(
+            (Join-Path $env:WINDIR "System32\OpenSSH\ssh-keygen.exe"),
+            (Join-Path $env:ProgramFiles "Git\usr\bin\ssh-keygen.exe")
+        )
+        if (-not $sshKeygen) {
+            throw "ssh-keygen.exe wurde nicht gefunden."
+        }
+
+        $sshDirectory = Join-Path $env:USERPROFILE ".ssh"
+        if (-not (Test-Path -LiteralPath $sshDirectory)) {
+            New-Item -ItemType Directory -Path $sshDirectory | Out-Null
+        }
+
+        $keyBase = Join-Path $sshDirectory "id_ed25519"
+        $publicKeyPath = "$keyBase.pub"
+
+        # PowerShell 5.1 verwirft leere Argumente ("") beim Aufruf externer
+        # Programme. '""' wird dagegen als leere Zeichenkette uebergeben - sonst
+        # wuerde ssh-keygen das jeweils naechste Argument als Passphrase lesen.
+        $emptyPassphrase = '""'
+
+        if (Test-Path -LiteralPath $keyBase) {
+            # Nur ein passwortloser Key kann unbeaufsichtigt weiterverwendet werden.
+            $derived = Invoke-Native -FilePath $sshKeygen -Arguments @("-y", "-P", $emptyPassphrase, "-f", $keyBase)
+            if (($derived.ExitCode -eq 0) -and $derived.Output.Trim()) {
+                if (-not (Test-Path -LiteralPath $publicKeyPath)) {
+                    $derived.Output.Trim() | Set-Content -LiteralPath $publicKeyPath -Encoding ascii
+                }
+            }
+            else {
+                $keyBase = Get-UnusedKeyBase -Directory $sshDirectory
+                $publicKeyPath = "$keyBase.pub"
+            }
+        }
+        elseif (Test-Path -LiteralPath $publicKeyPath) {
+            $keyBase = Get-UnusedKeyBase -Directory $sshDirectory
+            $publicKeyPath = "$keyBase.pub"
+        }
+
+        if (-not (Test-Path -LiteralPath $keyBase)) {
+            $result = Invoke-Native -FilePath $sshKeygen -Arguments @(
+                "-t", "ed25519",
+                "-N", $emptyPassphrase,
+                "-C", "$env:USERNAME@$env:COMPUTERNAME",
+                "-f", $keyBase
+            ) -Show
+            if ($result.ExitCode -ne 0) {
+                throw "Der SSH-Key konnte nicht erstellt werden (Code $($result.ExitCode))."
+            }
+            $summary.Add("[OK] Ein neuer passwortloser GitHub SSH-Key wurde erstellt: $keyBase")
+        }
+        else {
+            Write-Host "SSH-Key ist bereits vorhanden; ueberspringe Erstellung."
+            $summary.Add("[OK] Ein vorhandener SSH-Key wird verwendet: $keyBase")
+        }
+
+        if (-not (Test-Path -LiteralPath $publicKeyPath)) {
+            throw "Der oeffentliche SSH-Key wurde nicht gefunden: $publicKeyPath"
+        }
+
+        $publicKey = (Get-Content -LiteralPath $publicKeyPath -Raw).Trim()
+
+        $summary.Add("")
+        $summary.Add("Oeffentlicher SSH-Key:")
+        $summary.Add($publicKey)
+        $summary.Add("Bei GitHub hinterlegen: https://github.com/settings/ssh/new")
+    }
+
+    try {
+        $build = [Environment]::OSVersion.Version.Build
+        if ($build -lt 22631) {
+            throw "Nicht unterstuetzte Windows-Version (Build $build). Erforderlich ist Windows 11 23H2 oder neuer."
+        }
+
+        Write-Host "R&P Windows-Setup" -ForegroundColor Green
+        Write-Host "Vorhandene Installationen werden beibehalten und uebersprungen."
+
+        Initialize-Wsl
+        Initialize-WinGet
+
+        Install-WinGetPackage `
+            -Name "Git for Windows" `
+            -Id "Git.Git" `
+            -Command "git.exe" `
+            -CandidatePaths @(
+                (Join-Path $env:ProgramFiles "Git\cmd\git.exe"),
+                (Join-Path $env:LOCALAPPDATA "Programs\Git\cmd\git.exe")
+            )
+
+        Install-WinGetPackage `
+            -Name "Visual Studio Code" `
+            -Id "Microsoft.VisualStudioCode" `
+            -Command "code.cmd" `
+            -Scope "user" `
+            -CandidatePaths @(
+                (Join-Path $env:LOCALAPPDATA "Programs\Microsoft VS Code\bin\code.cmd"),
+                (Join-Path $env:ProgramFiles "Microsoft VS Code\bin\code.cmd")
+            )
+
+        Install-WinGetPackage `
+            -Name "Docker Desktop" `
+            -Id "Docker.DockerDesktop" `
+            -Command "Docker Desktop.exe" `
+            -CandidatePaths @(
+                (Join-Path $env:LOCALAPPDATA "Programs\DockerDesktop\Docker Desktop.exe"),
+                (Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe")
+            ) `
+            -Override "install --quiet --accept-license --backend=wsl-2 --no-windows-containers"
+
+        Add-DockerUser
+        Initialize-Git
+        Initialize-VsCodeExtension
+        Initialize-SshKey
+
+        $summary.Insert(0, "R&P Windows-Setup erfolgreich abgeschlossen.")
+        if ($script:RestartRequired) {
+            $summary.Add("")
+            $summary.Add("NEUSTART ERFORDERLICH: Windows muss jetzt einmal neu gestartet werden, damit WSL 2 aktiviert wird.")
+            if ($script:RerunAfterRestart) {
+                $summary.Add("Fuehre danach denselben Installationsbefehl erneut aus, um Ubuntu zu installieren bzw. auf WSL 2 zu konvertieren.")
+            }
+        }
+        else {
+            $summary.Add("")
+            $summary.Add("Kein Windows-Neustart ist fuer WSL erforderlich.")
+        }
+
+        $summary | Set-Content -LiteralPath $ResultPath -Encoding utf8
+        Write-Host "`n$($summary -join "`n")" -ForegroundColor Green
+    }
+    catch {
+        $errorSummary = @(
+            "R&P Windows-Setup ist fehlgeschlagen.",
+            "Fehler: $($_.Exception.Message)"
+        )
+        $errorSummary | Set-Content -LiteralPath $ResultPath -Encoding utf8
+        Write-Error $_
+        throw
+    }
+}
+
+function Read-GitIdentity {
+    do {
+        $email = (Read-Host "Git-E-Mail-Adresse").Trim()
+        try {
+            $address = [System.Net.Mail.MailAddress]::new($email)
+            $valid = $address.Address -eq $email
+        }
+        catch {
+            $valid = $false
+        }
+
+        if (-not $valid) {
+            Write-Host "Bitte gib eine gueltige E-Mail-Adresse ein." -ForegroundColor Yellow
+        }
+    } while (-not $valid)
+
+    $nameParts = @(
+        $email.Split("@")[0] -split "\." |
+            Where-Object { $_ } |
+            ForEach-Object {
+                $_.Substring(0, 1).ToUpperInvariant() + $_.Substring(1).ToLowerInvariant()
+            }
+    )
+    if ($nameParts.Count -eq 0) {
+        throw "Aus der E-Mail-Adresse konnte kein Git-Benutzername abgeleitet werden."
+    }
+
+    return [pscustomobject]@{
+        Email = $email
+        Name  = $nameParts -join " "
+    }
+}
+
+function Wait-ForKeyPress {
+    Write-Host "`nDruecke eine beliebige Taste zum Beenden ..." -ForegroundColor Cyan
+    try {
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    }
+    catch {
+        $null = Read-Host "Druecke die Eingabetaste zum Beenden"
+    }
+}
+
+try {
+    $gitIdentity = Read-GitIdentity
+    Write-Host "Git-Benutzername: $($gitIdentity.Name)" -ForegroundColor Green
+
+    $principal = [Security.Principal.WindowsPrincipal]::new(
+        [Security.Principal.WindowsIdentity]::GetCurrent()
+    )
+    $isAdministrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $resultFile = Join-Path ([IO.Path]::GetTempPath()) ("rp-windows-setup-{0}.txt" -f [guid]::NewGuid())
+
+    if ($isAdministrator) {
+        & $setup -ResultPath $resultFile -GitEmail $gitIdentity.Email -GitName $gitIdentity.Name
+    }
+    else {
+        Write-Host "Fordere einmalig Administratorrechte fuer WSL an ..." -ForegroundColor Yellow
+
+        $escapedResultFile = $resultFile.Replace("'", "''")
+        $escapedGitEmail = $gitIdentity.Email.Replace("'", "''")
+        $escapedGitName = $gitIdentity.Name.Replace("'", "''")
+        $payload = "& {`n$($setup.ToString())`n} -ResultPath '$escapedResultFile' -GitEmail '$escapedGitEmail' -GitName '$escapedGitName'"
+        $elevatedScript = Join-Path `
+            ([IO.Path]::GetTempPath()) `
+            ("rp-windows-setup-elevated-{0}.ps1" -f [guid]::NewGuid())
+        $payload | Set-Content -LiteralPath $elevatedScript -Encoding utf8
+
+        $process = $null
+        try {
+            # Start-Process setzt in PowerShell 5.1 keine Anfuehrungszeichen; der Pfad
+            # kann Leerzeichen enthalten (z. B. C:\Users\Max Mustermann\AppData\...).
+            $quotedScript = '"' + $elevatedScript + '"'
+            try {
+                $process = Start-Process `
+                    -FilePath "powershell.exe" `
+                    -Verb RunAs `
+                    -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $quotedScript) `
+                    -Wait `
+                    -PassThru `
+                    -ErrorAction Stop
+            }
+            catch {
+                throw "Administratorrechte wurden nicht erteilt. Bestaetige die Abfrage der Benutzerkontensteuerung und starte den Befehl erneut."
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $elevatedScript -Force -ErrorAction SilentlyContinue
+        }
+
+        if (Test-Path -LiteralPath $resultFile) {
+            Write-Host ""
+            Get-Content -LiteralPath $resultFile -Encoding utf8 | ForEach-Object { Write-Host $_ }
+        }
+
+        if (($null -eq $process) -or ($process.ExitCode -ne 0)) {
+            $exitCode = if ($null -eq $process) { "unbekannt" } else { $process.ExitCode }
+            throw "Das erhoehte Windows-Setup ist fehlgeschlagen (Code $exitCode)."
+        }
+    }
+
+    if (Test-Path -LiteralPath $resultFile) {
+        Remove-Item -LiteralPath $resultFile -Force -ErrorAction SilentlyContinue
+    }
+}
+finally {
+    Wait-ForKeyPress
+}
