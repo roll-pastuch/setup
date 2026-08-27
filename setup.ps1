@@ -12,7 +12,7 @@
 
     The script is intended to be run from a Gist like this:
 
-        irm <RAW-GIST-URL> | iex
+        irm https://raw.githubusercontent.com/roll-pastuch/setup/refs/heads/main/setup.ps1 | iex
 
     At startup, the script asks for the Git email address and derives the Git
     user name from it. If the current PowerShell is not elevated, Windows then
