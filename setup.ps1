@@ -184,7 +184,8 @@ $setup = {
         # und darf das Setup nicht abbrechen.
         $result = Invoke-Native -FilePath $script:Winget -Arguments @(
             "source", "update",
-            "--disable-interactivity"
+            "--disable-interactivity",
+            "--no-progress"
         ) -Show
         if ($result.ExitCode -ne 0) {
             Write-Host "Hinweis: Die WinGet-Paketquellen konnten nicht aktualisiert werden (Code $($result.ExitCode))." `
@@ -237,6 +238,7 @@ $setup = {
             "--accept-package-agreements",
             "--accept-source-agreements",
             "--disable-interactivity",
+            "--no-progress",
             "--no-upgrade"
         )
 
