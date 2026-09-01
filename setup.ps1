@@ -403,6 +403,19 @@ $setup = {
         return "/$drive/" + $Path.Substring($root.Length).Replace("\", "/")
     }
 
+    function ConvertTo-PosixShellArgument {
+        param([string] $Value)
+
+        # core.sshCommand wird spaeter von einer POSIX-Shell ausgewertet. Einfache
+        # Anfuehrungszeichen bleiben beim Aufruf von git.exe durch Windows
+        # PowerShell 5.1 erhalten; eingebettete doppelte Anfuehrungszeichen
+        # koennen dort dagegen entfernt werden (z. B. vor "C:/Program Files/...").
+        $apostrophe = [string] [char] 39
+        $doubleQuote = [string] [char] 34
+        $escapedApostrophe = $apostrophe + $doubleQuote + $apostrophe + $doubleQuote + $apostrophe
+        return $apostrophe + $Value.Replace($apostrophe, $escapedApostrophe) + $apostrophe
+    }
+
     function Initialize-Git {
         $git = Resolve-Executable -Command "git.exe" -CandidatePaths @(
             (Join-Path $env:ProgramFiles "Git\cmd\git.exe"),
@@ -603,8 +616,9 @@ $setup = {
         # Windows die Standard-OpenSSH-Pipe erkennt.
         [Environment]::SetEnvironmentVariable("SSH_AUTH_SOCK", $null, "User")
         $env:SSH_AUTH_SOCK = $agentSocketPosix
-        $gitSshCommand = 'env SSH_AUTH_SOCK="{0}" "{1}"' -f
-            $agentSocketPosix, $gitSsh.Replace("\", "/")
+        $gitSshCommand = "env SSH_AUTH_SOCK={0} {1}" -f
+            (ConvertTo-PosixShellArgument -Value $agentSocketPosix),
+            (ConvertTo-PosixShellArgument -Value $gitSsh.Replace("\", "/"))
         $gitSshResult = Invoke-Native -FilePath $git -Arguments @(
             "config", "--global", "core.sshCommand", $gitSshCommand
         )
