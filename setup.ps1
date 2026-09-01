@@ -6,7 +6,7 @@
 
 .DESCRIPTION
     Installs and configures WSL 2 for Docker Desktop, Git for Windows,
-    Visual Studio Code, Dev Containers, and a shared Git SSH agent.
+    Visual Studio Code, Dev Containers, and the Windows OpenSSH agent.
     Existing installations are detected and skipped. New installations use the
     latest versions available from WSL or WinGet.
 
@@ -364,58 +364,6 @@ $setup = {
         }
     }
 
-    function Get-GitToolPath {
-        param([string] $RelativePath)
-
-        $git = Resolve-Executable -Command "git.exe" -CandidatePaths @(
-            (Join-Path $env:ProgramFiles "Git\cmd\git.exe"),
-            (Join-Path $env:LOCALAPPDATA "Programs\Git\cmd\git.exe")
-        )
-        if (-not $git) {
-            throw "Git wurde installiert, aber git.exe wurde nicht gefunden."
-        }
-
-        $resolvedRoot = Split-Path (Split-Path $git -Parent) -Parent
-        $candidateRoots = @(
-            $resolvedRoot,
-            (Join-Path $env:ProgramFiles "Git"),
-            (Join-Path $env:LOCALAPPDATA "Programs\Git")
-        )
-        foreach ($gitRoot in $candidateRoots) {
-            $tool = Join-Path $gitRoot $RelativePath
-            if (Test-Path -LiteralPath $tool -PathType Leaf) {
-                return $tool
-            }
-        }
-
-        throw "Das Git-Werkzeug '$RelativePath' wurde nicht gefunden."
-    }
-
-    function ConvertTo-GitPosixPath {
-        param([string] $Path)
-
-        $root = [IO.Path]::GetPathRoot($Path)
-        if ($root -notmatch "^[A-Za-z]:\\$") {
-            throw "Der Pfad '$Path' liegt nicht auf einem lokalen Windows-Laufwerk."
-        }
-
-        $drive = $root.Substring(0, 1).ToLowerInvariant()
-        return "/$drive/" + $Path.Substring($root.Length).Replace("\", "/")
-    }
-
-    function ConvertTo-PosixShellArgument {
-        param([string] $Value)
-
-        # core.sshCommand wird spaeter von einer POSIX-Shell ausgewertet. Einfache
-        # Anfuehrungszeichen bleiben beim Aufruf von git.exe durch Windows
-        # PowerShell 5.1 erhalten; eingebettete doppelte Anfuehrungszeichen
-        # koennen dort dagegen entfernt werden (z. B. vor "C:/Program Files/...").
-        $apostrophe = [string] [char] 39
-        $doubleQuote = [string] [char] 34
-        $escapedApostrophe = $apostrophe + $doubleQuote + $apostrophe + $doubleQuote + $apostrophe
-        return $apostrophe + $Value.Replace($apostrophe, $escapedApostrophe) + $apostrophe
-    }
-
     function Initialize-Git {
         $git = Resolve-Executable -Command "git.exe" -CandidatePaths @(
             (Join-Path $env:ProgramFiles "Git\cmd\git.exe"),
@@ -570,7 +518,7 @@ $setup = {
     function Initialize-SshAgent {
         param([string] $KeyPath)
 
-        Write-Step "Konfiguriere Git SSH-Agent fuer Dev Containers"
+        Write-Step "Konfiguriere Windows SSH-Agent fuer Dev Containers"
 
         $git = Resolve-Executable -Command "git.exe" -CandidatePaths @(
             (Join-Path $env:ProgramFiles "Git\cmd\git.exe"),
@@ -579,229 +527,72 @@ $setup = {
         if (-not $git) {
             throw "Git wurde installiert, aber git.exe wurde nicht gefunden."
         }
-        $gitSsh = Get-GitToolPath -RelativePath "usr\bin\ssh.exe"
-        $sshAgent = Get-GitToolPath -RelativePath "usr\bin\ssh-agent.exe"
-        $sshAdd = Get-GitToolPath -RelativePath "usr\bin\ssh-add.exe"
-        $agentDirectory = Join-Path $env:LOCALAPPDATA "ssh-agent"
-        $agentSocket = Join-Path $agentDirectory "git-ssh-agent.sock"
-        $bridge = Join-Path $agentDirectory "ssh-agent-bridge-noconsole.exe"
-        $startupScript = Join-Path $agentDirectory "start-git-ssh-agent.ps1"
 
-        if (-not (Test-Path -LiteralPath $agentDirectory)) {
-            New-Item -ItemType Directory -Path $agentDirectory -Force | Out-Null
-        }
-
-        # Die Bridge wird auf eine feste Version und Pruefsumme fixiert. Sie
-        # stellt den MSYS-Agent von Git Bash ueber die Windows-OpenSSH-Pipe bereit.
-        $bridgeUrl = "https://github.com/amurzeau/ssh-agent-bridge/releases/download/v1.1/ssh-agent-bridge-noconsole.exe"
-        $bridgeHash = "54394689E8BA37A6A791A3B68CE630B4989AED585533127E8F9CBD1CFF51CF58"
-        $bridgeValid = (Test-Path -LiteralPath $bridge -PathType Leaf) -and
-            ((Get-FileHash -LiteralPath $bridge -Algorithm SHA256).Hash -eq $bridgeHash)
-        if (-not $bridgeValid) {
-            $bridgeDownload = "$bridge.download"
-            Remove-Item -LiteralPath $bridgeDownload -Force -ErrorAction SilentlyContinue
-            Invoke-WebRequest -Uri $bridgeUrl -OutFile $bridgeDownload -UseBasicParsing
-            $downloadHash = (Get-FileHash -LiteralPath $bridgeDownload -Algorithm SHA256).Hash
-            if ($downloadHash -ne $bridgeHash) {
-                Remove-Item -LiteralPath $bridgeDownload -Force -ErrorAction SilentlyContinue
-                throw "Die Pruefsumme der SSH-Agent-Bridge ist ungueltig."
+        # Alte Versionen dieses Setups verwendeten einen Git-for-Windows-Agent
+        # samt Bridge und core.sshCommand. Nur diese bekannte Konfiguration wird
+        # entfernt; eine eigene SSH-Konfiguration des Benutzers bleibt erhalten.
+        $legacySshCommand = Invoke-Native -FilePath $git -Arguments @(
+            "config", "--global", "--get", "core.sshCommand"
+        )
+        if (($legacySshCommand.ExitCode -eq 0) -and
+            ($legacySshCommand.Output -match "(?i)SSH_AUTH_SOCK=.*git-ssh-agent\.sock")) {
+            $unsetResult = Invoke-Native -FilePath $git -Arguments @(
+                "config", "--global", "--unset-all", "core.sshCommand"
+            )
+            if ($unsetResult.ExitCode -ne 0) {
+                throw "Die alte Git core.sshCommand-Konfiguration konnte nicht entfernt werden."
             }
-            Move-Item -LiteralPath $bridgeDownload -Destination $bridge -Force
         }
 
-        $agentSocketPosix = ConvertTo-GitPosixPath -Path $agentSocket
-        $keyPathPosix = ConvertTo-GitPosixPath -Path $KeyPath
-        # Git bekommt den MSYS-Socket nur innerhalb seines SSH-Kommandos. Eine
-        # globale SSH_AUTH_SOCK-Variable wuerde verhindern, dass VS Code unter
-        # Windows die Standard-OpenSSH-Pipe erkennt.
         [Environment]::SetEnvironmentVariable("SSH_AUTH_SOCK", $null, "User")
-        $env:SSH_AUTH_SOCK = $agentSocketPosix
-        $gitSshCommand = "env SSH_AUTH_SOCK={0} {1}" -f
-            (ConvertTo-PosixShellArgument -Value $agentSocketPosix),
-            (ConvertTo-PosixShellArgument -Value $gitSsh.Replace("\", "/"))
-        $gitSshResult = Invoke-Native -FilePath $git -Arguments @(
-            "config", "--global", "core.sshCommand", $gitSshCommand
-        )
-        if ($gitSshResult.ExitCode -ne 0) {
-            throw "Git core.sshCommand konnte nicht auf den Git SSH-Agent gesetzt werden."
+        Remove-Item Env:SSH_AUTH_SOCK -ErrorAction SilentlyContinue
+
+        $legacyTask = Get-ScheduledTask -TaskName "R&P Git SSH Agent" -ErrorAction SilentlyContinue
+        if ($null -ne $legacyTask) {
+            Stop-ScheduledTask -TaskName "R&P Git SSH Agent" -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName "R&P Git SSH Agent" -Confirm:$false
         }
-        if (-not ("RpEnvironmentChangeNotifier" -as [type])) {
-            Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public static class RpEnvironmentChangeNotifier {
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern IntPtr SendMessageTimeout(
-        IntPtr hWnd,
-        uint message,
-        UIntPtr wParam,
-        string lParam,
-        uint flags,
-        uint timeout,
-        out UIntPtr result
-    );
-}
-"@
-        }
-        $notificationResult = [UIntPtr]::Zero
-        [void] [RpEnvironmentChangeNotifier]::SendMessageTimeout(
-            [IntPtr] 0xffff,
-            0x1A,
-            [UIntPtr]::Zero,
-            "Environment",
-            0x2,
-            5000,
-            [ref] $notificationResult
-        )
-
-        # Die Windows-OpenSSH-Pipe gehoert der Bridge. Der separate Windows-
-        # Agent wuerde sonst denselben Namen belegen und einen zweiten Keystore
-        # verwenden.
-        $windowsSshAgent = Get-Service -Name "ssh-agent" -ErrorAction SilentlyContinue
-        if ($null -ne $windowsSshAgent) {
-            if ($windowsSshAgent.Status -ne "Stopped") {
-                Stop-Service -Name "ssh-agent" -Force
-            }
-            Set-Service -Name "ssh-agent" -StartupType Disabled
-        }
-
-        $startupTemplate = @'
-$ErrorActionPreference = "Continue"
-$env:SSH_AUTH_SOCK = '__AGENT_SOCKET_POSIX__'
-$sshAgent = '__SSH_AGENT__'
-$sshAdd = '__SSH_ADD__'
-$keyPath = '__KEY_PATH__'
-$agentSocket = '__AGENT_SOCKET__'
-$bridge = '__BRIDGE__'
-
-& $sshAdd "-l" *> $null
-$agentState = $LASTEXITCODE
-if ($agentState -eq 2) {
-    Remove-Item -LiteralPath $agentSocket -Force -ErrorAction SilentlyContinue
-    & $sshAgent "-a" $env:SSH_AUTH_SOCK *> $null
-    Start-Sleep -Milliseconds 500
-    & $sshAdd "-l" *> $null
-    $agentState = $LASTEXITCODE
-}
-if ($agentState -in @(0, 1)) {
-    # Der Key ist passwortlos; erneutes Hinzufuegen ist idempotent und stellt
-    # sicher, dass auch ein spaeter ausgewaehlter Key im Agent liegt.
-    & $sshAdd $keyPath *> $null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Der SSH-Key konnte nicht in den Git SSH-Agent geladen werden."
-    }
-}
-else {
-    throw "Der Git SSH-Agent konnte nicht gestartet werden."
-}
-
-$bridgeProcesses = @(
-    Get-Process -Name "ssh-agent-bridge-noconsole" -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -eq $bridge }
-)
-foreach ($bridgeProcess in $bridgeProcesses) {
-    Stop-Process -Id $bridgeProcess.Id -Force
-}
-$bridgeArguments = '--from pipe --to cygwin --pipe "\\.\pipe\openssh-ssh-agent" --cygwin-socket "{0}" --no-gui-error' -f
-    $agentSocket.Replace("\", "/")
-Start-Process -FilePath $bridge -ArgumentList $bridgeArguments -WindowStyle Hidden
-'@
-        $startupContent = $startupTemplate
-        $startupContent = $startupContent.Replace(
-            "__AGENT_SOCKET_POSIX__",
-            $agentSocketPosix.Replace("'", "''")
-        )
-        $startupContent = $startupContent.Replace("__SSH_AGENT__", $sshAgent.Replace("'", "''"))
-        $startupContent = $startupContent.Replace("__SSH_ADD__", $sshAdd.Replace("'", "''"))
-        $startupContent = $startupContent.Replace("__KEY_PATH__", $keyPathPosix.Replace("'", "''"))
-        $startupContent = $startupContent.Replace("__AGENT_SOCKET__", $agentSocket.Replace("'", "''"))
-        $startupContent = $startupContent.Replace("__BRIDGE__", $bridge.Replace("'", "''"))
-        Set-Content -LiteralPath $startupScript -Value $startupContent -Encoding utf8
-
-        $powershell = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
-        $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        $action = New-ScheduledTaskAction `
-            -Execute $powershell `
-            -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$startupScript`""
-        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $account
-        $principal = New-ScheduledTaskPrincipal `
-            -UserId $account `
-            -LogonType Interactive `
-            -RunLevel Limited
-        $settings = New-ScheduledTaskSettingsSet `
-            -AllowStartIfOnBatteries `
-            -DontStopIfGoingOnBatteries `
-            -MultipleInstances IgnoreNew
-        Register-ScheduledTask `
-            -TaskName "R&P Git SSH Agent" `
-            -Action $action `
-            -Trigger $trigger `
-            -Principal $principal `
-            -Settings $settings `
-            -Description "Startet den Git-for-Windows SSH-Agent fuer Git und VS Code Dev Containers." `
-            -Force | Out-Null
-        Start-ScheduledTask -TaskName "R&P Git SSH Agent"
-
-        $agentReady = $false
-        for ($attempt = 0; $attempt -lt 10; $attempt++) {
-            Start-Sleep -Milliseconds 500
-            $agentTest = Invoke-Native -FilePath $sshAdd -Arguments @("-l")
-            if ($agentTest.ExitCode -eq 0) {
-                $agentReady = $true
-                break
-            }
-        }
-        if (-not $agentReady) {
-            throw "Der Git SSH-Agent wurde gestartet, stellt den SSH-Key aber nicht bereit."
-        }
+        Get-Process -Name "ssh-agent-bridge-noconsole" -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
 
         $windowsSshAdd = Join-Path $env:WINDIR "System32\OpenSSH\ssh-add.exe"
-        $pipeReady = $false
-        for ($attempt = 0; $attempt -lt 10; $attempt++) {
-            Start-Sleep -Milliseconds 500
-            if (Test-Path -LiteralPath $windowsSshAdd -PathType Leaf) {
-                $savedSocket = $env:SSH_AUTH_SOCK
-                Remove-Item Env:SSH_AUTH_SOCK -ErrorAction SilentlyContinue
-                try {
-                    $pipeTest = Invoke-Native -FilePath $windowsSshAdd -Arguments @("-l")
-                }
-                finally {
-                    $env:SSH_AUTH_SOCK = $savedSocket
-                }
-                if ($pipeTest.ExitCode -eq 0) {
-                    $pipeReady = $true
-                    break
+        $windowsAgent = Get-Service -Name "ssh-agent" -ErrorAction SilentlyContinue
+        if (($null -eq $windowsAgent) -or
+            (-not (Test-Path -LiteralPath $windowsSshAdd -PathType Leaf))) {
+            Write-Host "Installiere den Windows OpenSSH Client ..."
+            $capability = Get-WindowsCapability -Online -Name "OpenSSH.Client~~~~0.0.1.0" -ErrorAction Stop
+            if ($capability.State -ne "Installed") {
+                $installResult = Add-WindowsCapability -Online -Name "OpenSSH.Client~~~~0.0.1.0" -ErrorAction Stop
+                if ($installResult.RestartNeeded) {
+                    $script:RestartRequired = $true
                 }
             }
-            else {
-                $pipe = [IO.Pipes.NamedPipeClientStream]::new(
-                    ".",
-                    "openssh-ssh-agent",
-                    [IO.Pipes.PipeDirection]::InOut
-                )
-                try {
-                    $pipe.Connect(250)
-                    $pipeReady = $pipe.IsConnected
-                }
-                catch {
-                    $pipeReady = $false
-                }
-                finally {
-                    $pipe.Dispose()
-                }
-                if ($pipeReady) {
-                    break
-                }
-            }
-        }
-        if (-not $pipeReady) {
-            throw "Der Git SSH-Agent ist nicht ueber die Windows-OpenSSH-Pipe erreichbar."
+            $windowsAgent = Get-Service -Name "ssh-agent" -ErrorAction SilentlyContinue
         }
 
-        $summary.Add("[OK] Git verwendet das mitgelieferte OpenSSH und den Git-for-Windows SSH-Agent.")
-        $summary.Add("[OK] VS Code Dev Containers erreicht denselben Agent ueber die Windows-OpenSSH-Pipe.")
+        if (($null -eq $windowsAgent) -or
+            (-not (Test-Path -LiteralPath $windowsSshAdd -PathType Leaf))) {
+            throw "Der Windows OpenSSH Client oder der Dienst ssh-agent wurde nicht gefunden."
+        }
+
+        Set-Service -Name "ssh-agent" -StartupType Automatic
+        if ((Get-Service -Name "ssh-agent").Status -ne "Running") {
+            Start-Service -Name "ssh-agent"
+        }
+
+        $addResult = Invoke-Native -FilePath $windowsSshAdd -Arguments @($KeyPath) -Show
+        if ($addResult.ExitCode -ne 0) {
+            throw "Der SSH-Key konnte nicht in den Windows SSH-Agent geladen werden."
+        }
+
+        $agentTest = Invoke-Native -FilePath $windowsSshAdd -Arguments @("-l")
+        if ($agentTest.ExitCode -ne 0) {
+            throw "Der Windows SSH-Agent wurde gestartet, stellt den SSH-Key aber nicht bereit."
+        }
+
+        $summary.Add("[OK] Lokales Git verwendet seine Standard-SSH-Konfiguration.")
+        $summary.Add("[OK] Der Windows SSH-Agent stellt den Key fuer VS Code Dev Containers bereit.")
     }
-
     try {
         $build = [Environment]::OSVersion.Version.Build
         if ($build -lt 22631) {
