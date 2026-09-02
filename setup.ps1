@@ -276,22 +276,6 @@ $setup = {
         return @($states)
     }
 
-    function Enable-WslFeatures {
-        Write-Host "Aktiviere die fuer WSL 2 erforderlichen Windows-Komponenten ..."
-        foreach ($name in @("Microsoft-Windows-Subsystem-Linux", "VirtualMachinePlatform")) {
-            try {
-                Enable-WindowsOptionalFeature `
-                    -Online `
-                    -FeatureName $name `
-                    -All `
-                    -NoRestart `
-                    -ErrorAction Stop | Out-Null
-            }
-            catch {
-                throw "Die Windows-Komponente '$name' konnte nicht aktiviert werden: $($_.Exception.Message)"
-            }
-        }
-    }
     function Get-WslVersion {
         $result = Invoke-Native -FilePath "wsl.exe" -Arguments @("--version")
         if ($result.ExitCode -ne 0) {
@@ -305,15 +289,24 @@ $setup = {
 
         return [version] $match.Value
     }
+
     function Initialize-Wsl {
         Write-Step "Pruefe WSL 2 fuer Docker Desktop"
 
         $featureStates = Get-WslFeatureState
         $featuresEnabled = @($featureStates | Where-Object { $_ -ne "Enabled" }).Count -eq 0
         if (-not $featuresEnabled) {
-            Enable-WslFeatures
+            Write-Host "Installiere WSL ohne Linux-Distribution ..."
+            $install = Invoke-Native `
+                -FilePath "wsl.exe" `
+                -Arguments @("--install", "--no-distribution", "--web-download") `
+                -Show
+            if ($install.ExitCode -notin @(0, 1641, 3010)) {
+                throw "WSL konnte nicht installiert werden (Code $($install.ExitCode))."
+            }
+
             $script:RestartRequired = $true
-            $summary.Add("[OK] Die Windows-Komponenten fuer WSL 2 wurden aktiviert.")
+            $summary.Add("[OK] WSL wurde ohne Linux-Distribution installiert.")
             return
         }
 
