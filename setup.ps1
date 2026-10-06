@@ -9,6 +9,8 @@
     Visual Studio Code, Dev Containers, and the Windows OpenSSH agent.
     Existing installations are detected and skipped. New installations use the
     latest versions available from WSL or WinGet.
+    If WinGet cannot start, repairs App Installer and installs a missing
+    Windows App Runtime 1.8 dependency before retrying.
 
     The script is intended to be run from a Gist like this:
 
@@ -134,24 +136,113 @@ $setup = {
         return $null
     }
 
-    function Initialize-WinGet {
-        Write-Step "Pruefe Windows Package Manager (WinGet)"
-
+    function Get-WorkingWinGetPath {
         $wingetPath = Resolve-Executable -Command "winget.exe" -CandidatePaths @(
             (Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\winget.exe")
         )
-
-        if (-not $wingetPath) {
+        if ($wingetPath) {
             try {
-                Add-AppxPackage `
-                    -RegisterByFamilyName `
-                    -MainPackage "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe" `
-                    -ErrorAction Stop
+                $version = Invoke-Native -FilePath $wingetPath -Arguments @("--version")
+                # Ein vorhandener WindowsApps-Alias kann trotz LASTEXITCODE=0
+                # beim Start scheitern. Deshalb auch die Versionsausgabe pruefen.
+                if (($version.ExitCode -eq 0) -and ($version.Output.Trim() -match '^v?\d+\.\d+\.\d+')) {
+                    return $wingetPath
+                }
             }
             catch {
-                Write-Host "WinGet ist nicht registriert; repariere die Installation ..."
-                [Net.ServicePointManager]::SecurityProtocol = `
-                    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                Write-Host "WinGet kann nicht gestartet werden: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+
+        return $null
+    }
+
+    function Repair-AppInstallerRegistration {
+        $package = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction Stop |
+            Select-Object -First 1
+        if ($null -eq $package) {
+            Add-AppxPackage `
+                -RegisterByFamilyName `
+                -MainPackage "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe" `
+                -ErrorAction Stop
+            return
+        }
+
+        $manifestPath = Join-Path $package.InstallLocation "AppxManifest.xml"
+        [xml] $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop
+        $dependencies = $manifest.SelectNodes("//*[local-name()='PackageDependency']")
+        foreach ($dependency in $dependencies) {
+            if ($dependency.GetAttribute("Name") -ne "Microsoft.WindowsAppRuntime.1.8") {
+                continue
+            }
+
+            $architecture = $package.Architecture.ToString().ToLowerInvariant()
+            $minimumVersion = [version] $dependency.GetAttribute("MinVersion")
+            $installed = @(Get-AppxPackage -Name Microsoft.WindowsAppRuntime.1.8 -ErrorAction Stop |
+                Where-Object {
+                    ([version] $_.Version -ge $minimumVersion) -and
+                    ($_.Architecture.ToString().ToLowerInvariant() -in @($architecture, "neutral"))
+                })
+            if ($installed.Count -gt 0) {
+                continue
+            }
+            if ($architecture -notin @("x64", "x86", "arm64")) {
+                throw "Nicht unterstuetzte App-Installer-Architektur: $architecture"
+            }
+
+            Write-Host "Installiere die fehlende Windows App Runtime 1.8 ($architecture) ..."
+            # Offizieller Microsoft-Installer fuer 1.8.12; installiert auch
+            # die weiteren Runtime-Pakete. Quelle:
+            # https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads-archive
+            $runtimeUri = "https://aka.ms/windowsappsdk/1.8/1.8.260921001/windowsappruntimeinstall-$architecture.exe"
+            $installerDirectory = Join-Path ([IO.Path]::GetTempPath()) ("rp-runtime-{0}" -f [guid]::NewGuid())
+            New-Item -ItemType Directory -Path $installerDirectory -ErrorAction Stop | Out-Null
+            $installerPath = Join-Path $installerDirectory "WindowsAppRuntimeInstall.exe"
+            try {
+                Invoke-WebRequest -Uri $runtimeUri -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
+                $signature = Get-AuthenticodeSignature -FilePath $installerPath
+                if (($signature.Status -ne "Valid") -or
+                    ($null -eq $signature.SignerCertificate) -or
+                    ($signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)')) {
+                    throw "Der Windows-App-Runtime-Installer hat keine gueltige Microsoft-Signatur."
+                }
+                $process = Start-Process -FilePath $installerPath -Wait -PassThru -ErrorAction Stop
+                if ($process.ExitCode -notin @(0, 1641, 3010)) {
+                    throw "Windows App Runtime konnte nicht installiert werden (Code $($process.ExitCode))."
+                }
+                if ($process.ExitCode -in @(1641, 3010)) {
+                    $script:RestartRequired = $true
+                }
+            }
+            finally {
+                Remove-Item -LiteralPath $installerDirectory -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        Write-Host "Registriere App Installer erneut ..."
+        Add-AppxPackage -DisableDevelopmentMode -Register $manifestPath -ErrorAction Stop
+    }
+
+    function Initialize-WinGet {
+        Write-Step "Pruefe Windows Package Manager (WinGet)"
+
+        $wingetPath = Get-WorkingWinGetPath
+
+        if (-not $wingetPath) {
+            Write-Host "WinGet fehlt oder kann nicht gestartet werden; repariere die Installation ..."
+            [Net.ServicePointManager]::SecurityProtocol = `
+                [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            try {
+                Repair-AppInstallerRegistration
+            }
+            catch {
+                Write-Host "App Installer konnte nicht registriert werden: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+
+            Update-SessionPath
+            $wingetPath = Get-WorkingWinGetPath
+            if (-not $wingetPath) {
+                Write-Host "Repariere WinGet mit Microsoft.WinGet.Client ..."
                 Install-PackageProvider `
                     -Name NuGet `
                     -Force `
@@ -166,16 +257,13 @@ $setup = {
                     -Confirm:$false
                 Import-Module Microsoft.WinGet.Client -Force
                 Repair-WinGetPackageManager -Force -Latest | Out-Null
+                Update-SessionPath
+                $wingetPath = Get-WorkingWinGetPath
             }
-
-            Update-SessionPath
-            $wingetPath = Resolve-Executable -Command "winget.exe" -CandidatePaths @(
-                (Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\winget.exe")
-            )
         }
 
         if (-not $wingetPath) {
-            throw "WinGet konnte nicht installiert oder gefunden werden."
+            throw "WinGet kann auch nach der Reparatur nicht gestartet werden. Pruefe die App-Installer-Installation und ihre Abhaengigkeiten."
         }
 
         $script:Winget = $wingetPath
